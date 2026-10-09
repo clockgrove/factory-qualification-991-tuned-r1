@@ -137,3 +137,41 @@ test('addresses normalize singleton ambiguity, real UTC dates, numbers and liter
   assert.deepEqual(addressIntent(queryParams(intent)), intent);
   assert.equal(transition(createState(), {type: 'intent', patch: {q: ''}}).resultOp.token, 0);
 });
+
+test('overview selection identity excludes paging and ordering but normalizes facets and search case', async () => {
+  const {overviewIdentity, isOverviewCurrent} = await import('../../public/state.js');
+  const intent = {q: 'Billing', service: ['Search', 'Billing', 'Search']};
+  assert.equal(overviewIdentity(intent), overviewIdentity({...intent, q: 'billing', page: 9, pageSize: 50, sort: 'severity', direction: 'asc', service: ['Billing', 'Search']}));
+  let s = transition(createState(), {type: 'overview:start'}); const token = s.overviewOp.token;
+  s = transition(s, {type: 'intent', patch: {sort: 'severity', pageSize: 50}});
+  assert.equal(s.overviewOp.token, token); assert.equal(s.overviewOp.pending, true);
+  const data = {total: 0, services: []};
+  s = transition(s, {type: 'overview:success', token, data});
+  assert.equal(isOverviewCurrent(s), true); assert.equal(s.overview.data, data);
+  const snapshot = s.overview;
+  s = transition(s, {type: 'intent', patch: {status: ['open']}});
+  assert.equal(isOverviewCurrent(s), false); assert.equal(s.overview, snapshot);
+});
+
+test('overview retry owns current identity and obsolete success, failure and cleanup cannot replace it', () => {
+  let s = transition(createState(), {type: 'overview:start'});
+  s = transition(s, {type: 'overview:success', token: s.overviewOp.token, data: {total: 5, services: []}});
+  const snapshot = s.overview;
+  s = transition(s, {type: 'overview:start'}); const old = s.overviewOp.token;
+  s = transition(s, {type: 'restore', view: {q: 'Billing', status: ['open']}});
+  s = transition(s, {type: 'overview:start'}); const failed = s.overviewOp.token;
+  s = transition(s, {type: 'overview:failure', token: failed, error: 'Current overview failed'});
+  assert.equal(s.overview, snapshot); assert.equal(announcement(s), 'Service overview: Current overview failed');
+  for (const type of ['overview:success', 'overview:failure', 'overview:finish']) assert.equal(transition(s, {type, token: old, data: {total: 99}, error: 'obsolete'}), s);
+  s = transition(s, {type: 'overview:start'});
+  assert.equal(s.overviewOp.error, null); assert.equal(queryParams(s.intent).get('q'), 'Billing');
+  assert.equal(transition(s, {type: 'overview:finish', token: failed}), s);
+  s = transition(s, {type: 'address', intent: {q: 'Search'}});
+  const token = s.overviewOp.token;
+  s = transition(s, {type: 'overview:start'});
+  assert.equal(transition(s, {type: 'overview:failure', token, error: 'prior'}), s);
+  s = transition(s, {type: 'result:start'});
+  s = transition(s, {type: 'result:failure', token: s.resultOp.token, error: 'Results failed'});
+  s = transition(s, {type: 'overview:failure', token: s.overviewOp.token, error: 'Overview failed'});
+  assert.equal(announcement(s), 'Results failed');
+});
