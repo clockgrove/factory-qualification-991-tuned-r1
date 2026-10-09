@@ -58,12 +58,13 @@ function parseQuery(params, exporting) {
   return query;
 }
 
-function matching(rows, query) {
+function matching(rows, query, sorted = true) {
   const result = rows.filter(row =>
     ['id', 'title', 'description'].some(key => row[key].toLowerCase().includes(query.q)) &&
     Object.keys(facets).every(key => !query[key].length || query[key].includes(row[key])) &&
     (!query.from || row.openedAt.slice(0, 10) >= query.from) &&
     (!query.to || row.openedAt.slice(0, 10) <= query.to));
+  if (!sorted) return result;
   const sign = query.direction === 'asc' ? 1 : -1;
   result.sort((a, b) => {
     if (query.sort === 'severity') {
@@ -88,6 +89,29 @@ function summary(rows) {
     highSeverity: rows.filter(row => ['critical', 'high'].includes(row.severity)).length,
     openedByDay: [...days].sort(([a], [b]) => compare(a, b)).map(([date, count]) => ({ date, count })),
   };
+}
+
+function servicesOverview(rows) {
+  const services = new Map();
+  for (const row of rows) {
+    if (!services.has(row.service)) services.set(row.service, {
+      service: row.service, incidentCount: 0, unresolvedCount: 0,
+      highSeverityCount: 0, resolutionHours: 0, resolvedCount: 0,
+    });
+    const entry = services.get(row.service);
+    entry.incidentCount++;
+    if (row.status === 'open' || row.status === 'in_progress') entry.unresolvedCount++;
+    if (row.severity === 'critical' || row.severity === 'high') entry.highSeverityCount++;
+    if (row.status === 'resolved') {
+      entry.resolutionHours += (Date.parse(row.resolvedAt) - Date.parse(row.openedAt)) / 3600000;
+      entry.resolvedCount++;
+    }
+  }
+  return { total: rows.length, services: [...services.values()]
+    .sort((a, b) => b.unresolvedCount - a.unresolvedCount || compare(a.service, b.service))
+    .map(({ resolutionHours, resolvedCount, ...entry }) => ({
+      ...entry, averageResolutionHours: resolvedCount ? resolutionHours / resolvedCount : null,
+    })) };
 }
 
 function csvCell(value) {
@@ -125,6 +149,10 @@ export async function createAppServer() {
         return json(response, 405, { error: { code: 'METHOD_NOT_ALLOWED', message: 'Use GET for this read-only server' } });
       }
       const url = new URL(request.url, 'http://127.0.0.1');
+      if (url.pathname === '/api/services-overview') {
+        const query = parseQuery(url.searchParams, false);
+        return json(response, 200, servicesOverview(matching(rows, query, false)));
+      }
       if (url.pathname === '/api/incidents' || url.pathname === '/api/export.csv') {
         const exporting = url.pathname === '/api/export.csv';
         const query = parseQuery(url.searchParams, exporting);
