@@ -5,7 +5,7 @@ import {mkdir, readFile} from 'node:fs/promises';
 import {dirname, resolve} from 'node:path';
 import {once} from 'node:events';
 import {createAppServer} from '../../server/app.mjs';
-import {expected, rows, parseCSV, csvRows} from './oracle.js';
+import {expected, expectedOverview, rows, parseCSV, csvRows} from './oracle.js';
 
 const alias = dirname(execFileSync('bash', ['-c', 'command -v qualification-chromium'], {encoding: 'utf8'}).trim());
 process.env.PLAYWRIGHT_BROWSERS_PATH = resolve(alias, '../browsers');
@@ -64,6 +64,18 @@ test('real Chromium: correctness, persisted views, keyboard, phone and overlappi
     const cdp = await context.newCDPSession(page);
     const throttle = latency => cdp.send('Network.emulateNetworkConditions', {offline: false, latency, downloadThroughput: -1, uploadThroughput: -1});
     await cdp.send('Network.enable');
+    const checkOverview = async (options = {}) => {
+      await expect(page.locator('#overview')).toHaveAttribute('aria-busy', 'false');
+      await expect(page.locator('#overview')).toHaveAttribute('data-stale', 'false');
+      await expect(page.locator('#overview-selection')).toContainText('Measures represent current selections');
+      const oracle = expectedOverview(options);
+      assert.deepEqual(await page.locator('.service-card h3').allTextContents(), oracle.services.map(x => x.service));
+      assert.deepEqual(await page.locator('.service-card dl dd').allTextContents(), oracle.services.flatMap(x => [
+        String(x.incidentCount), String(x.unresolvedCount), String(x.highSeverityCount),
+        x.averageResolutionHours === null ? 'Unavailable' : x.averageResolutionHours.toLocaleString(undefined, {maximumFractionDigits: 2})
+      ]));
+      await expect(page.locator('#overview-message')).toHaveText(oracle.total ? '' : 'No services match these selections. Change your search or clear a filter.');
+    };
     const check = async (options = {}) => {
       await expect(page.locator('#results')).toHaveAttribute('aria-busy', 'false');
       await expect(page.locator('#freshness')).toHaveText('Current selections');
@@ -249,6 +261,198 @@ test('real Chromium: correctness, persisted views, keyboard, phone and overlappi
       await detail(expected({q: 'Notifications'}).items[1]); await page.keyboard.press('Escape'); await check({q: 'Notifications'});
       await search('nothing matches this phrase'); await check({q: 'nothing matches this phrase'}); await expect(page.locator('#result-message')).toContainText('No incidents match'); await expect(page.locator('#next')).toBeDisabled();
     });
+    await t.test('overview follows whole-result selections while pagination and sorting leave measures unchanged', async () => {
+      await clear(); await check(); await checkOverview();
+      await search('incident'); await check({q: 'incident'}); await checkOverview({q: 'incident'});
+      await page.locator('#service').getByLabel('Billing', {exact: true}).check();
+      await page.locator('#service').getByLabel('Notifications', {exact: true}).check();
+      const options = {q: 'incident', service: ['Billing', 'Notifications']};
+      await check(options); await checkOverview(options);
+      assert.ok(expected(options).items.length > 50);
+      await page.locator('#next').click(); await check({...options, page: 2}); await checkOverview(options);
+      await page.getByLabel('Rows per page').selectOption('50'); await check({...options, pageSize: 50}); await checkOverview(options);
+      await page.locator('#next').click(); await check({...options, pageSize: 50, page: 2}); await checkOverview(options);
+      await page.getByLabel('Sort by').selectOption('severity'); await check({...options, pageSize: 50, sort: 'severity'}); await checkOverview(options);
+      await page.getByLabel('Order', {exact: true}).selectOption('asc'); await check({...options, pageSize: 50, sort: 'severity', direction: 'asc'}); await checkOverview(options);
+      await page.goto(`http://127.0.0.1:${port}/?status=resolved`); await check({status: ['resolved']}); await checkOverview({status: ['resolved']});
+      await page.goto(`http://127.0.0.1:${port}/?status=open&status=in_progress`); await check({status: ['open', 'in_progress']}); await checkOverview({status: ['open', 'in_progress']});
+      await page.goto(`http://127.0.0.1:${port}/`); await check(); await checkOverview();
+    });
+    await t.test('overview owns overlapping selections, real connection failure and current retry', async () => {
+      await clear(); await check();
+      await throttle(1200);
+      const settlements = new Set();
+      const settled = request => { if (request.url().includes('/api/services-overview?')) settlements.add(request); };
+      page.on('requestfinished', settled); page.on('requestfailed', settled);
+      try {
+        const olderReady = page.waitForRequest(r => r.url().includes('/api/services-overview?') && new URL(r.url()).searchParams.get('q') === 'Billing');
+        await search('Billing'); const older = await olderReady;
+        await expect(page.locator('#overview')).toHaveAttribute('aria-busy', 'true');
+        await expect(page.locator('#overview')).toHaveAttribute('data-stale', 'true');
+        await expect(page.locator('#overview-message')).toContainText('Loading service measures');
+        await expect(page.locator('#overview-selection')).toContainText('Current selections: Search: Billing');
+        await expect(page.locator('#overview-selection')).toContainText('Previous measures represent: No search or filters');
+        // The previous request is observed while latency keeps it pending; the next intent owns the failure and retry.
+        assert.equal(settlements.has(older), false);
+        await stop(); await search('Uploads');
+        await expect(page.locator('#overview-message button')).toHaveText('Retry');
+        await expect(page.locator('#overview')).toHaveAttribute('aria-busy', 'false');
+        await expect(page.locator('#overview-selection')).toContainText('Current selections: Search: Uploads');
+        const currentError = await page.locator('#overview-message').textContent();
+        await page.waitForFunction(() => document.querySelector('#overview').getAttribute('aria-busy') === 'false');
+        const deadline = Date.now() + 10000;
+        while (!settlements.has(older) && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 20));
+        assert.equal(settlements.has(older), true, 'obsolete real overview request settled within deadline');
+        assert.equal(await page.locator('#overview-message').textContent(), currentError);
+        await expect(page.locator('#overview')).toHaveAttribute('aria-busy', 'false');
+        await start(); await throttle(600);
+        await page.locator('#overview-message button').click();
+        await expect(page.locator('#overview')).toHaveAttribute('aria-busy', 'true');
+        await expect(page.locator('#overview-message')).toContainText('Loading service measures');
+        await checkOverview({q: 'Uploads'});
+        await page.locator('#result-message button').click(); await check({q: 'Uploads'});
+        await throttle(0);
+        await search('nothing matches this phrase'); await check({q: 'nothing matches this phrase'});
+        await checkOverview({q: 'nothing matches this phrase'});
+        await expect(page.locator('#overview-message')).toBeVisible();
+        await expect(page.locator('.service-card')).toHaveCount(0);
+      } finally {
+        page.off('requestfinished', settled); page.off('requestfailed', settled); await throttle(0);
+      }
+    });
+    await t.test('triage order, duplicate, literal notes, persistence, unchanged results and malformed storage', async () => {
+      await clear(); await search('incident'); await check({q: 'incident'});
+      const selected = expected({q: 'incident'}).items.slice(0, 2);
+      const ids = selected.map(x => x.id);
+      const add = async row => {
+        await page.locator(`#rows button[data-incident="${row.id}"]`).click(); await detail(row);
+        await page.getByRole('button', {name: 'Add to personal triage', exact: true}).click();
+        await expect(page.getByRole('button', {name: 'Added to personal triage', exact: true})).toBeVisible();
+        await page.keyboard.press('Escape');
+      };
+      await add(selected[0]); await add(selected[1]); await add(selected[0]);
+      assert.deepEqual(await page.locator('#triage-list button[data-triage]').evaluateAll(xs => xs.map(x => x.dataset.triage)), ids);
+      const note = '<b>Investigate</b> & "retry", then continue; <script>literal</script>!';
+      const noteField = page.getByLabel(`Plain-text note for ${ids[0]}`, {exact: true});
+      await noteField.fill('first draft'); await noteField.fill(note);
+      const address = page.url(); const resultIDs = await page.locator('#rows button').evaluateAll(xs => xs.map(x => x.dataset.incident));
+      await page.reload(); await check({q: 'incident'});
+      await expect(noteField).toHaveValue(note);
+      assert.deepEqual(await page.locator('#triage-list button[data-triage]').evaluateAll(xs => xs.map(x => x.dataset.triage)), ids);
+      assert.equal(await page.locator('#triage-list b, #triage-list script').count(), 0);
+      const reopen = page.locator(`#triage-list button[data-triage="${ids[0]}"]`);
+      await reopen.focus(); await reopen.press('Enter'); await detail(selected[0]);
+      await page.keyboard.press('Escape'); await expect(reopen).toBeFocused();
+      assert.notEqual(await reopen.evaluate(x => getComputedStyle(x).outlineStyle), 'none');
+      assert.equal(page.url(), address);
+      assert.deepEqual(await page.locator('#rows button').evaluateAll(xs => xs.map(x => x.dataset.incident)), resultIDs);
+      const remove = page.getByRole('button', {name: `Remove ${ids[0]}`, exact: true});
+      await remove.focus(); await remove.press('Enter');
+      const stored = await page.evaluate(() => JSON.parse(localStorage.getItem('incident-explorer.triage.v1')));
+      assert.deepEqual(stored.entries.map(x => x.id), [ids[1]]);
+      assert.equal(JSON.stringify(stored).includes(note), false);
+      await page.reload(); await check({q: 'incident'});
+      await expect(page.getByLabel(`Plain-text note for ${ids[0]}`, {exact: true})).toHaveCount(0);
+      await page.evaluate(() => localStorage.setItem('incident-explorer.triage.v1', '{malformed persisted triage'));
+      await page.reload(); await check({q: 'incident'});
+      await expect(page.locator('#triage-message')).toContainText('Stored triage is malformed');
+      await expect(page.locator('#triage-list')).toContainText('No incidents in personal triage');
+      await add(selected[0]);
+      await expect(page.locator('#triage-list button[data-triage]')).toHaveCount(1);
+      await page.getByLabel(`Plain-text note for ${ids[0]}`, {exact: true}).fill('usable after malformed storage');
+      await check({q: 'incident'});
+    });
+    await t.test('fresh phone overview-first landing and keyboard reachability without content loss', async () => {
+      const phone = await browser.newContext({viewport: {width: 375, height: 812}, isMobile: true, hasTouch: true});
+      const original = page;
+      try {
+        page = await phone.newPage(); page.setDefaultTimeout(10000);
+        await page.goto(`http://127.0.0.1:${port}/`); await check(); await checkOverview();
+        assert.equal(await page.evaluate(() => localStorage.getItem('incident-explorer.triage.v1')), null);
+        const tops = await page.evaluate(() => ['overview', 'results', 'triage', 'filters'].map(id => document.getElementById(id).getBoundingClientRect().top));
+        assert.ok(tops.every((top, i) => i === 0 || top > tops[i - 1]), 'fresh phone puts overview before incidents, triage and controls');
+        assert.ok(tops[0] < 812, 'overview begins in initial phone viewport');
+        const fits = async locator => {
+          await locator.scrollIntoViewIfNeeded();
+          assert.equal(await locator.evaluate(x => { const r = x.getBoundingClientRect(); return r.left >= 0 && r.right <= innerWidth; }), true);
+        };
+        assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), true);
+        for (const card of await page.locator('.service-card').all()) {
+          await fits(card); await expect(card.locator('dt')).toHaveCount(4); await expect(card.locator('dd')).toHaveCount(4);
+        }
+        for (const [name, target] of [['Incidents', '#results'], ['Personal triage', '#triage'], ['Filters and saved views', '#filters'], ['Service overview', '#overview']]) {
+          const link = page.getByRole('link', {name, exact: true}); await link.focus();
+          assert.notEqual(await link.evaluate(x => getComputedStyle(x).outlineStyle), 'none');
+          await link.press('Enter'); await expect(page.locator(target)).toBeFocused(); await fits(page.locator(target));
+        }
+        const status = page.locator('#status').getByLabel('open', {exact: true});
+        await status.focus(); await status.press('Space'); await check({status: ['open']}); await checkOverview({status: ['open']});
+        assert.equal(expectedOverview({status: ['open']}).services.every(x => x.averageResolutionHours === null), true);
+        await expect(page.locator('.service-card dd').filter({hasText: 'Unavailable'})).toHaveCount(expectedOverview({status: ['open']}).services.length);
+        const row = expected({status: ['open']}).items[0];
+        const incident = page.locator('#rows button').first(); await incident.focus(); await incident.press('Enter'); await detail(row);
+        const add = page.getByRole('button', {name: 'Add to personal triage', exact: true}); await fits(add); await add.focus(); await add.press('Enter');
+        await page.keyboard.press('Escape'); await expect(incident).toBeFocused();
+        const note = page.getByLabel(`Plain-text note for ${row.id}`, {exact: true}); await fits(note); await note.fill('<phone> & note');
+        const reopen = page.locator('#triage-list button[data-triage]'); await fits(reopen); await reopen.focus(); await reopen.press('Enter'); await detail(row);
+        await page.keyboard.press('Escape'); await expect(reopen).toBeFocused();
+        const remove = page.getByRole('button', {name: `Remove ${row.id}`, exact: true}); await fits(remove); await remove.focus(); await remove.press('Enter');
+        await expect(page.locator('#triage-list')).toContainText('No incidents in personal triage');
+        await check({status: ['open']});
+        assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), true);
+      } finally { page = original; await phone.close(); }
+    });
+    await t.test('native browser storage quota failure preserves usable current-visit triage and notes', async () => {
+      const quotaContext = await browser.newContext();
+      const original = page;
+      try {
+        page = await quotaContext.newPage(); page.setDefaultTimeout(10000);
+        page.on('pageerror', error => errors.push(error.message));
+        await page.goto(`http://127.0.0.1:${port}/`); await check(); await checkOverview();
+        const quota = await page.evaluate(() => {
+          const key = 'incident-explorer.integration-quota-filler';
+          const value = 'x'.repeat(6 * 1024 * 1024);
+          let lower = 0, upper = value.length, attempts = 0, failures = 0;
+          // Real native setItem calls find the exact capacity in at most 24 attempts.
+          // No storage API is replaced and no incident or saved-view metadata is changed.
+          while (lower < upper && attempts < 24) {
+            const size = Math.ceil((lower + upper) / 2); attempts++;
+            try { localStorage.setItem(key, value.slice(0, size)); lower = size; }
+            catch (error) {
+              if (error.name !== 'QuotaExceededError') throw error;
+              failures++; upper = size - 1;
+            }
+          }
+          if (lower !== upper) throw new Error('Native storage capacity search exceeded its finite bound');
+          localStorage.setItem(key, value.slice(0, lower));
+          return {attempts, failures, characters: lower};
+        });
+        assert.ok(quota.failures > 0, 'real Chromium reported native QuotaExceededError');
+        assert.ok(quota.characters > 0 && quota.attempts <= 24);
+        const row = expected().items[0];
+        await page.locator('#rows button').first().click(); await detail(row);
+        await page.getByRole('button', {name: 'Add to personal triage', exact: true}).click();
+        await page.keyboard.press('Escape');
+        await expect(page.locator('#triage-message')).toContainText('Triage browser storage could not be updated');
+        await expect(page.locator('#triage-message')).toContainText('current list and notes remain usable for this visit');
+        await expect(page.locator('#triage-list button[data-triage]')).toHaveCount(1);
+        const note = '<quota> & "current visit"';
+        const input = page.getByLabel(`Plain-text note for ${row.id}`, {exact: true});
+        await input.fill(note); await expect(input).toHaveValue(note);
+        await expect(page.locator('#triage-message')).toContainText('changes may not survive a reload');
+        assert.equal(await page.evaluate(() => localStorage.getItem('incident-explorer.triage.v1')), null);
+        await page.locator('#triage-list button[data-triage]').click(); await detail(row);
+        await page.keyboard.press('Escape'); await expect(input).toHaveValue(note); await check();
+        await page.getByRole('button', {name: `Remove ${row.id}`, exact: true}).click();
+        await expect(page.locator('#triage-list')).toContainText('No incidents in personal triage');
+      } finally {
+        try {
+          if (!page.isClosed() && page !== original) await page.evaluate(() => localStorage.removeItem('incident-explorer.integration-quota-filler'));
+        } finally { page = original; await quotaContext.close(); }
+      }
+    });
+    // Native write failure is exercised above. Native storage access/read exceptions
+    // remain source-reviewed and component-tested; they are not manufactured here.
     assert.deepEqual(errors, []);
   } finally {
     try { await context?.close(); } finally { try { await browser?.close(); } finally { await stop(); } }

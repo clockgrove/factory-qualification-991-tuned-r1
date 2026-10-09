@@ -19,6 +19,25 @@ export function expected(options = {}) {
   return {items, summary: {total: items.length, unresolved: items.filter(x => x.status !== 'resolved').length, highSeverity: items.filter(x => ranks[x.severity] >= 3).length, openedByDay: [...counts].sort().map(([date, count]) => ({date, count}))}};
 }
 export const csvRows = items => [fields, ...items.map(row => fields.map(key => row[key] === null ? '' : Array.isArray(row[key]) ? JSON.stringify(row[key]) : String(row[key])))];
+// Calculate each measure directly from canonical matches, independently of server reducers.
+export function expectedOverview(options = {}) {
+  const selected = new Set(expected(options).items.map(row => row.id));
+  const items = rows.filter(row => selected.has(row.id));
+  const services = [...new Set(items.map(row => row.service))].map(service => {
+    const matches = items.filter(row => row.service === service);
+    const resolved = matches.filter(row => row.status === 'resolved');
+    return {
+      service, incidentCount: matches.length,
+      unresolvedCount: matches.filter(row => row.status === 'open' || row.status === 'in_progress').length,
+      highSeverityCount: matches.filter(row => row.severity === 'critical' || row.severity === 'high').length,
+      averageResolutionHours: resolved.length ? resolved.reduce((sum, row) =>
+        sum + (Date.parse(row.resolvedAt) - Date.parse(row.openedAt)) / 3600000, 0) / resolved.length : null,
+    };
+  });
+  services.sort((a, b) => b.unresolvedCount - a.unresolvedCount ||
+    (a.service < b.service ? -1 : a.service > b.service ? 1 : 0));
+  return {total: items.length, services};
+}
 export function parseCSV(text) {
   const result = []; let row = [], cell = '', quoted = false;
   for (let i = 0; i < text.length; i++) {

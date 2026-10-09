@@ -1,6 +1,12 @@
 # Incident explorer frontend
 
-Serve this directory from the local app's same origin. `index.html` loads `app.js`, `state.js`, and `styles.css`; requests use the settled `/api/incidents`, `/api/incidents/:id`, and `/api/export.csv` endpoints. No dataset or server is embedded in the frontend.
+From the repository root run `npm run seed`, then `npm run start`, and open **http://127.0.0.1:3000**. The server prints the actual loopback URL; `PORT=3001 npm run start` selects another port and `PORT=0 npm run start` selects an available port. Stop with Ctrl+C or SIGTERM. Serve this directory from the local app's same origin. `index.html` loads `app.js`, `state.js`, `triage.js`, and `styles.css`; requests use `/api/incidents`, `/api/incidents/:id`, `/api/services-overview`, and `/api/export.csv`. No dataset or server is embedded in the frontend.
+
+On a fresh phone visit, the service overview precedes incidents, triage, and filters. Labeled section links reach all four areas. The overview covers the entire matching result: incident count includes all matches, unresolved means open or in progress, and critical + high counts those two severities. Average resolution hours is opening-to-resolution time averaged over resolved incidents only, shown to at most two decimal places. “Unavailable” means no resolved matches; the API returns null, not zero. Services sort by unresolved count descending then name. Changing page, page size or sort leaves the measures unchanged. Loading and selection labels identify the current intent and any previous measures; failures offer Retry and empty results explain how to find matches.
+
+Use Add to personal triage in complete details, then edit the labeled plain-text note. Repeated additions do not duplicate an incident or change added order. Triage retains recognizable incident information; its incident button reopens full details without losing the applied search/results. Removing membership clears the note. Notes use text values, so angle brackets, quotes and punctuation do not become HTML. Controls have visible keyboard focus, and service cards and triage actions fit a narrow screen.
+
+Triage uses `incident-explorer.triage.v1` in this browser origin's localStorage, independently of saved views and the address. Reload retains membership and notes; a different hostname, port or browser profile has separate storage. Nothing is sent to the backend or an external service. Malformed persisted values are rejected with an explanation and a usable new list. Unavailable reads and failed writes also explain the persistence limitation; current-visit membership and edits remain usable but may not survive reload. Clearing browser storage removes personal metadata, and there is no synchronization or backup.
 
 Search is submitted with Search or Enter. Facet, date, sorting, and page-size changes apply immediately and return to page one. Dates and displayed timestamps use UTC. The overview and daily counts describe the full matching result. While updating, the previous completed rows and summaries remain explicitly marked, and page controls are disabled. CSV exports the current applied selections and sort, across all pages; tags follow the API's JSON-array CSV representation.
 
@@ -13,9 +19,17 @@ The native details dialog supports keyboard dismissal, exposes every incident fi
 Run the repository's exact verification command from the checkout:
 
 ```sh
+npm run pretest
+qualification-browser-smoke
 npm test
 ```
 
 Discoverable tests under `tests/frontend/` exercise the actual DOM-free state module with direct events. These establish component behavior, including overlapping intents and retries; they do not establish real HTTP or browser integration. The integration suites run real sandbox-enabled Chromium against the existing backend and compare with an independent canonical-data oracle. See the root README for preparation, browser qualification and startup instructions.
 
 Component review: `state.js` separates the requested intent from the last displayed snapshot and publishes rows and whole-result summaries atomically. Pending or stale queries lock pagination, and synchronous page transitions are clamped before dispatch. The UI retains the native modal and return target while detail ownership changes; it renders dataset values through text nodes. Independent operation tokens gate success, failure, and cleanup, and export gates download side effects after reading the response. This review establishes frontend structure and state behavior only.
+
+Overview ownership review: `changeIntent` supersedes the overview token when search, facets or dates change, retains the last snapshot and clears obsolete errors. Its filter identity excludes pagination/sort and normalizes search case. `loadOverview` captures the token before HTTP and routes success, error and finally cleanup through `transition`; all writers require the current token and identity, and success/failure also require pending state. Cancellation saves work; token gates prevent obsolete cleanup from clearing a newer load. Rendering derives current/previous labels from that same identity. The browser journey observes real pending requests with latency and combines supersession with server shutdown and current retry; component tests cover late writers that cancellation makes hard to force in Chromium.
+
+Storage review: `app.js` catches failure to obtain localStorage. `createTriage` catches unavailable reads, rejects malformed versioned shapes and duplicate IDs as a whole, and publishes in-memory membership/notes before attempting writes. A failed write preserves that state and reports that reload may lose changes; a later successful write clears the write warning. Read warnings remain visible. Browser tests exercise malformed real localStorage and native quota exhaustion, verifying usable membership and notes after failed writes. The quota filler is removed in cleanup. Component tests also exercise read/write exceptions without treating those component inputs as real-browser proof.
+
+Runtime limitation: localStorage access denial and unavailable reads are not forced in the sandbox-enabled browser suite. Their evidence is production source review and component checks. Native write/quota failure is exercised separately from the ordinary reload-persistence journey.

@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { once } from 'node:events';
 import { spawn } from 'node:child_process';
 import { createAppServer } from '../../server/app.mjs';
-import { rows, expected, parseCSV, csvRows } from './oracle.js';
+import { rows, expected, expectedOverview, parseCSV, csvRows } from './oracle.js';
 
 function parameters(options) {
   const result = new URLSearchParams();
@@ -21,14 +21,14 @@ async function close(server) {
   });
 }
 
-test('integration: canonical data through real HTTP, complete pages, summaries, details and CSV', async t => {
+test('integration: canonical data through real HTTP, complete pages, summaries, details and CSV', { timeout: 120000 }, async t => {
   const server = await createAppServer();
   try {
     server.listen(0, '127.0.0.1');
     await once(server, 'listening');
     const base = `http://127.0.0.1:${server.address().port}`;
     const list = async (options = {}) => {
-      const response = await fetch(`${base}/api/incidents?${parameters(options)}`);
+      const response = await fetch(`${base}/api/incidents?${parameters(options)}`, { signal: AbortSignal.timeout(5000) });
       assert.equal(response.status, 200);
       const actual = await response.json();
       const oracle = expected(options);
@@ -94,11 +94,11 @@ test('integration: canonical data through real HTTP, complete pages, summaries, 
     await t.test('every detail field for all incidents is unchanged', async () => {
       // Sequential requests avoid creating an artificial connection-pressure failure.
       for (const row of rows) {
-        const response = await fetch(`${base}/api/incidents/${row.id}`);
+        const response = await fetch(`${base}/api/incidents/${row.id}`, { signal: AbortSignal.timeout(5000) });
         assert.equal(response.status, 200);
         assert.deepEqual(await response.json(), row);
       }
-      const missing = await fetch(`${base}/api/incidents/INC-999999`);
+      const missing = await fetch(`${base}/api/incidents/INC-999999`, { signal: AbortSignal.timeout(5000) });
       assert.equal(missing.status, 404);
       assert.equal((await missing.json()).error.code, 'NOT_FOUND');
     });
@@ -110,7 +110,7 @@ test('integration: canonical data through real HTTP, complete pages, summaries, 
         { q: 'Note:', service: ['Accounts', 'Billing'], status: ['open', 'resolved'] },
         { q: 'no incident matches this' },
       ]) {
-        const response = await fetch(`${base}/api/export.csv?${parameters({ ...options, page: 2, pageSize: 25 })}`);
+        const response = await fetch(`${base}/api/export.csv?${parameters({ ...options, page: 2, pageSize: 25 })}`, { signal: AbortSignal.timeout(5000) });
         assert.equal(response.status, 200);
         assert.match(response.headers.get('content-type'), /text\/csv/);
         assert.match(response.headers.get('content-disposition'), /attachment/);
@@ -118,6 +118,44 @@ test('integration: canonical data through real HTTP, complete pages, summaries, 
       }
       assert.ok(rows.some(row => /[",\n]/.test(row.description)));
       assert.ok(rows.some(row => row.resolvedAt === null));
+    });
+
+    await t.test('service overview matrix uses all canonical matches independently of presentation', async () => {
+      const combined = { q: 'InCiDeNt', service: ['Accounts', 'Billing'], status: ['open', 'in_progress', 'resolved'], severity: ['critical', 'high'], from: '2026-04-15', to: '2026-06-13' };
+      assert.ok(expected(combined).items.length > 50);
+      const selections = [
+        {}, combined, {status: ['resolved']}, {status: ['open', 'in_progress']},
+        {service: ['Billing', 'Billing', 'Search']},
+        ...['iNc-000001', 'SLOW RESPONSE', 'second LINE: <sample>', '"retry, then continue"', '.*', 'Cobalt'].map(q => ({q})),
+        {from: '2026-04-01', to: '2026-04-01'}, {from: '2026-06-29', to: '2026-06-29'},
+        {from: '2026-06-13'}, {to: '2026-04-15'}, {q: 'no incident matches this'},
+      ];
+      for (const selection of selections) {
+        const oracle = expectedOverview(selection);
+        for (const pageSize of [25, 50]) for (const sort of ['openedAt', 'severity']) for (const direction of ['asc', 'desc']) {
+          const lastPage = Math.max(1, Math.ceil(oracle.total / pageSize));
+          for (const page of new Set([1, 2, lastPage, 99999])) {
+            const options = {...selection, pageSize, sort, direction, page};
+            const response = await fetch(`${base}/api/services-overview?${parameters(options)}`, {signal: AbortSignal.timeout(5000)});
+            assert.equal(response.status, 200);
+            assert.deepEqual(await response.json(), oracle);
+            // List and overview must apply identical filters even on clamped later pages.
+            assert.equal((await list(options)).total, oracle.total);
+          }
+        }
+      }
+      const resolved = expectedOverview({status: ['resolved']}).services;
+      assert.ok(resolved.every(entry => entry.unresolvedCount === 0 && entry.averageResolutionHours > 0));
+      assert.deepEqual(resolved.map(entry => entry.service), resolved.map(entry => entry.service).sort());
+      assert.ok(expectedOverview({status: ['open', 'in_progress']}).services.every(entry => entry.averageResolutionHours === null));
+      assert.deepEqual(expectedOverview({q: 'no incident matches this'}), {total: 0, services: []});
+      for (const query of ['unknown=yes', 'page=0', 'pageSize=100', 'sort=id', 'direction=down', 'q=a&q=b', 'service=billing', 'status=closed', 'severity=urgent', 'from=2026-02-30', 'from=2026-06-01&to=2026-04-01']) {
+        const overview = await fetch(`${base}/api/services-overview?${query}`, {signal: AbortSignal.timeout(5000)});
+        const incidents = await fetch(`${base}/api/incidents?${query}`, {signal: AbortSignal.timeout(5000)});
+        assert.equal(overview.status, 400);
+        assert.equal(incidents.status, 400);
+        assert.deepEqual(await overview.json(), await incidents.json());
+      }
     });
   } finally {
     await close(server);
@@ -146,10 +184,10 @@ test('integration: exact npm run start serves the app and the owned process grou
       });
     });
     clearTimeout(startupTimer);
-    const response = await fetch(endpoint);
+    const response = await fetch(endpoint, { signal: AbortSignal.timeout(5000) });
     assert.equal(response.status, 200);
     assert.match(response.headers.get('content-type'), /text\/html/);
-    const incidents = await fetch(`${endpoint}/api/incidents`);
+    const incidents = await fetch(`${endpoint}/api/incidents`, { signal: AbortSignal.timeout(5000) });
     assert.deepEqual((await incidents.json()).items, expected().items.slice(0, 25));
   } finally {
     clearTimeout(startupTimer);
