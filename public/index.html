@@ -8,10 +8,11 @@
   <script type="module" src="/app.js"></script>
 </head>
 <body>
-  <a class="skip-link" href="#results">Skip to incidents</a>
+  <a class="skip-link" href="#overview">Skip to service overview</a>
   <header class="masthead"><div><p class="eyebrow">Support intelligence · Fictional dataset</p><h1>Incident explorer</h1><p>Find the pattern. Understand the incident.</p></div><button id="export" type="button">Download CSV</button></header>
+  <nav class="workspace-nav" aria-label="Workspace sections"><a href="#overview">Service overview</a><a href="#results">Incidents</a><a href="#triage">Personal triage</a><a href="#filters">Filters and saved views</a></nav>
   <main>
-    <aside aria-label="Explorer controls">
+    <aside id="filters" tabindex="-1" aria-label="Explorer controls">
       <form id="query-form">
         <h2>Explore incidents</h2>
         <label for="search">Search ID, title or description</label>
@@ -24,6 +25,11 @@
       </form>
       <section class="saved" aria-labelledby="saved-title"><h2 id="saved-title">Saved views</h2><form id="save-form"><label for="view-name">Name this view</label><input id="view-name" maxlength="80" required placeholder="e.g. Billing follow-up"><button type="submit" class="secondary">Save current view</button></form><p id="storage-message" role="status"></p><ul id="views"></ul></section>
     </aside>
+    <section id="overview" tabindex="-1" aria-labelledby="overview-title">
+      <p class="eyebrow">Operational overview · Entire matching result</p><h2 id="overview-title">Which services need attention?</h2>
+      <p>Incident count includes every match. Unresolved means open or in progress. High severity means critical or high. Average resolution hours uses only resolved incidents, from opening to resolution; unavailable means none are resolved. Services are ordered by unresolved count, then name.</p>
+      <p id="overview-selection" class="muted"></p><div id="overview-message" class="operation-message"></div><div id="service-measures" class="service-measures"></div>
+    </section>
     <section id="results" tabindex="-1" aria-labelledby="result-title">
       <div class="section-heading"><div><p class="eyebrow">All matching incidents</p><h2 id="result-title">Results overview</h2></div><span id="freshness" class="muted"></span></div>
       <div id="active-filters" class="chips" aria-label="Active selections"></div>
@@ -35,6 +41,7 @@
       <nav class="pagination" aria-label="Result pages"><button id="previous" class="secondary" type="button">Previous</button><span id="page-label"></span><button id="next" class="secondary" type="button">Next</button></nav>
       <div id="export-message" class="operation-message"></div>
     </section>
+    <section id="triage" tabindex="-1" aria-labelledby="triage-title"><h2 id="triage-title">Personal triage</h2><p>Keep incidents in added order with plain-text notes, stored only in this browser.</p><p id="triage-message" role="status"></p><ul id="triage-list"></ul></section>
   </main>
   <dialog id="detail" aria-labelledby="detail-title"><div class="detail-heading"><h2 id="detail-title">Incident details</h2><button id="close-detail" class="secondary" type="button">Close details</button></div><div id="detail-content"></div></dialog>
   <p id="announcement" class="sr-only" role="status" aria-live="polite" aria-atomic="true"></p>
